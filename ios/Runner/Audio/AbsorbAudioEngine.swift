@@ -152,7 +152,17 @@ final class AbsorbAudioEngine: NSObject {
       }
       self.trackIndex = targetIndex
 
-      self.loadTrack(atIndex: targetIndex, localStart: localStart, autoPlay: false, completion: completion)
+      if Self.isHLS(self.trackUrls[targetIndex]), self.trackUrls[targetIndex].path.contains("/hls/") {
+        // ABS publishes the full playlist before the first segments exist.
+        // AVPlayer can walk every URI after a 404 even without metadata loads.
+        // Prime the start window before giving the playlist to AVPlayer.
+        self.emit("[AudioEngine] HLS initial load: waiting for segments at \(localStart)s")
+        self.prepareHLSSeek(target: targetIndex, position: localStart, resumePlayback: false) { _ in
+          completion(nil) // HLS duration comes from the session/item observer.
+        }
+      } else {
+        self.loadTrack(atIndex: targetIndex, localStart: localStart, autoPlay: false, completion: completion)
+      }
     }
   }
 
@@ -233,9 +243,9 @@ final class AbsorbAudioEngine: NSObject {
     completion?(false)
   }
 
-  private func prepareHLSSeek(target: Int, position: Double,
+  private func prepareHLSSeek(target: Int, position: Double, resumePlayback: Bool? = nil,
                               completion: @escaping (Bool) -> Void) {
-    let resume = hlsSeekCompletion != nil ? hlsSeekShouldPlay : player.rate > 0
+    let resume = resumePlayback ?? (hlsSeekCompletion != nil ? hlsSeekShouldPlay : player.rate > 0)
     cancelHLSSeek()
     hlsSeekShouldPlay = resume
     hlsSeekCompletion = completion
