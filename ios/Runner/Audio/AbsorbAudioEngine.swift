@@ -42,6 +42,10 @@ final class AbsorbAudioEngine: NSObject {
   private var totalDurationS: Double = 0
   private var currentItem: AVPlayerItem?
   private var currentEpoch: UInt = 0
+  private var hlsSeekTask: Task<Void, Never>?
+  private var hlsSeekGeneration: UInt = 0
+  private var hlsSeekCompletion: ((Bool) -> Void)?
+  private var hlsSeekShouldPlay = false
 
   // Book id of whatever is currently loaded. Set by load() so the
   // Flutter-suspended controller (AbsorbPlayerCore) can tell whether the engine
@@ -116,6 +120,7 @@ final class AbsorbAudioEngine: NSObject {
             completion: @escaping (Double?) -> Void) {
     queue.async { [weak self] in
       guard let self = self else { completion(nil); return }
+      self.cancelHLSSeek()
       // No session activation here: loading is silent, and play() activates
       // before any audio starts. Activating on load stole the audio from
       // whatever was playing (Spotify stopped the moment Absorb opened) when
@@ -155,6 +160,10 @@ final class AbsorbAudioEngine: NSObject {
     queue.async { [weak self] in
       guard let self = self else { return }
       self.activateSession()
+      if self.hlsSeekCompletion != nil {
+        self.hlsSeekShouldPlay = true
+        return
+      }
       self.player.play()
       self.player.rate = self.speed
       self.emitState()
@@ -164,6 +173,7 @@ final class AbsorbAudioEngine: NSObject {
   func pause() {
     queue.async { [weak self] in
       guard let self = self else { return }
+      self.hlsSeekShouldPlay = false
       self.player.pause()
       self.emitState()
     }
@@ -172,6 +182,7 @@ final class AbsorbAudioEngine: NSObject {
   func stop() {
     queue.async { [weak self] in
       guard let self = self else { return }
+      self.cancelHLSSeek()
       self.currentItem = nil
       self._currentItemId = nil
       self.resetQueuedTracks()
@@ -194,6 +205,11 @@ final class AbsorbAudioEngine: NSObject {
       let target = max(0, min(requested, self.trackUrls.count - 1))
       let localTarget = localS.isFinite ? max(0, localS) : 0
 
+      let url = self.trackUrls[target]
+      if Self.isHLS(url), url.path.contains("/hls/") {
+        self.prepareHLSSeek(target: target, position: localTarget, completion: completion)
+        return
+      }
       if target == self.trackIndex, self.currentItem != nil {
         let serial = self.beginSeek(localTarget, fallback: localTarget)
         self.applySeek(localTarget, serial: serial, completion: completion)
@@ -204,6 +220,77 @@ final class AbsorbAudioEngine: NSObject {
           completion(true)
         }
         self.delegate?.engineDidChangeTrack(trackIndex: target, totalTracks: self.trackUrls.count)
+      }
+    }
+  }
+
+  private func cancelHLSSeek() {
+    hlsSeekGeneration &+= 1
+    hlsSeekTask?.cancel()
+    hlsSeekTask = nil
+    let completion = hlsSeekCompletion
+    hlsSeekCompletion = nil
+    completion?(false)
+  }
+
+  private func prepareHLSSeek(target: Int, position: Double,
+                              completion: @escaping (Bool) -> Void) {
+    let resume = hlsSeekCompletion != nil ? hlsSeekShouldPlay : player.rate > 0
+    cancelHLSSeek()
+    hlsSeekShouldPlay = resume
+    hlsSeekCompletion = completion
+    let generation = hlsSeekGeneration
+    let url = trackUrls[target]
+    let headers = trackHeaders
+    currentEpoch &+= 1
+    resetQueuedTracks()
+    _ = beginSeek(position, fallback: position)
+    emit("[AudioEngine] HLS seek: waiting for segments at \(position)s")
+    // Remove the outgoing item so it cannot request the old transcode window
+    // while we prepare the new one.
+    player.pause()
+    detachCurrentItem()
+    currentItem = nil
+    player.removeAllItems()
+    processingState = .buffering
+    emitState()
+    hlsSeekTask = Task {
+      do {
+        try await AbsorbHLSSeekPreparation.wait(playlistURL: url, headers: headers, position: position)
+        finishHLSSeek(generation: generation, target: target, position: position, error: nil)
+      } catch {
+        finishHLSSeek(generation: generation, target: target, position: position, error: error)
+      }
+    }
+  }
+
+  private func finishHLSSeek(generation: UInt, target: Int, position: Double, error: Error?) {
+    queue.async {
+      guard generation == self.hlsSeekGeneration else { return }
+      self.hlsSeekTask = nil
+      if let error = error {
+        let callback = self.hlsSeekCompletion
+        self.hlsSeekCompletion = nil
+        self.processingState = .idle
+        self.emitState()
+        self.emit("[AudioEngine] HLS seek preparation failed: \(error.localizedDescription)")
+        self.delegate?.engineDidError(message: "HLS seek preparation failed: \(error.localizedDescription)",
+                                      code: "hls_seek_failed")
+        callback?(false)
+        return
+      }
+      self.emit("[AudioEngine] HLS seek: segments ready at \(position)s")
+      self.trackIndex = target
+      self.loadTrack(atIndex: target, localStart: position, autoPlay: false) { _ in
+        guard generation == self.hlsSeekGeneration else { return }
+        let callback = self.hlsSeekCompletion
+        self.hlsSeekCompletion = nil
+        if self.hlsSeekShouldPlay {
+          self.player.play()
+          self.player.rate = self.speed
+        }
+        self.emitState()
+        callback?(true)
       }
     }
   }
@@ -242,6 +329,13 @@ final class AbsorbAudioEngine: NSObject {
       self.nextItemId = itemId
 
       guard let firstUrl = tracks.first?.url else {
+        self.nextItem = nil
+        completion(false)
+        return
+      }
+      // Do not inspect an on-demand transcode before it becomes current.
+      // Its playlist can list segments the server has not generated yet.
+      guard !Self.isHLS(firstUrl) else {
         self.nextItem = nil
         completion(false)
         return
@@ -291,6 +385,8 @@ final class AbsorbAudioEngine: NSObject {
       self.eqEnabled = true
       if self.tapAttached { return }
       guard let item = self.currentItem else { return }
+      // HLS must not be scanned for asset tracks to install a file-based EQ tap.
+      if let asset = item.asset as? AVURLAsset, Self.isHLS(asset.url) { return }
       if self.player.rate > 0 {
         self.loadTrack(atIndex: self.trackIndex,
                        localStart: self.getPositionS(),
@@ -468,7 +564,8 @@ final class AbsorbAudioEngine: NSObject {
     guard index < trackUrls.count else { completion(nil); return }
     let url = trackUrls[index]
     let headers = trackHeaders
-    let eqEnabled = self.eqEnabled
+    let isHLS = Self.isHLS(url)
+    let eqEnabled = self.eqEnabled && !isHLS
 
     let item = makePlayerItem(url: url, headers: headers)
     currentEpoch &+= 1
@@ -480,17 +577,10 @@ final class AbsorbAudioEngine: NSObject {
     processingState = .loading
     emitState()
 
-    // Preload tracks so the EQ tap can attach synchronously before playback
-    // (attachTapSync), and so load failures surface early.
-    let asset = item.asset
-    asset.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { [weak self] in
+    // File assets preload metadata for EQ. HLS goes straight to AVPlayer:
+    // probing tracks/duration can request ungenerated segments far ahead.
+    prepareForPlayback(item, isHLS: isHLS) { [weak self] decodedDurationS in
       guard let self = self else { completion(nil); return }
-      var err: NSError?
-      let status = asset.statusOfValue(forKey: "tracks", error: &err)
-      let decodedDurationS = asset.duration.seconds
-      if status != .loaded {
-        self.emit("[AudioEngine] loadTrack idx=\(index) tracks-load failed status=\(status.rawValue) err=\(err?.localizedDescription ?? "nil")")
-      }
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { completion(nil); return }
         guard self.currentEpoch == myEpoch else {
@@ -512,6 +602,7 @@ final class AbsorbAudioEngine: NSObject {
         } else {
           self.tapAttached = false
         }
+        self.player.automaticallyWaitsToMinimizeStalling = isHLS
         self.player.actionAtItemEnd = itemEndAction
         self.player.removeAllItems()
         self.player.insert(item, after: nil)
@@ -542,13 +633,39 @@ final class AbsorbAudioEngine: NSObject {
     }
   }
 
+  private static func isHLS(_ url: URL) -> Bool {
+    url.pathExtension.lowercased() == "m3u8"
+  }
+
+  private func prepareForPlayback(_ item: AVPlayerItem, isHLS: Bool,
+                                  completion: @escaping (Double) -> Void) {
+    if isHLS {
+      emit("[AudioEngine] HLS: skipping asset metadata scan and EQ tap")
+      completion(.nan)
+      return
+    }
+    let asset = item.asset
+    asset.loadValuesAsynchronously(forKeys: ["tracks", "duration"]) { [weak self] in
+      var error: NSError?
+      let status = asset.statusOfValue(forKey: "tracks", error: &error)
+      if status != .loaded {
+        self?.emit("[AudioEngine] tracks-load failed status=\(status.rawValue) err=\(error?.localizedDescription ?? "nil")")
+      }
+      completion(asset.duration.seconds)
+    }
+  }
+
   private func makePlayerItem(url: URL, headers: [String: String]) -> AVPlayerItem {
     var options: [String: Any] = [:]
     if !headers.isEmpty {
       options["AVURLAssetHTTPHeaderFieldsKey"] = headers
     }
     let asset = AVURLAsset(url: url, options: options)
-    let item = AVPlayerItem(asset: asset)
+    // The convenience initializer automatically requests asset duration.
+    let item = Self.isHLS(url)
+      ? AVPlayerItem(asset: asset, automaticallyLoadedAssetKeys: [])
+      : AVPlayerItem(asset: asset)
+    if Self.isHLS(url) { item.preferredForwardBufferDuration = 12 }
     item.audioTimePitchAlgorithm = .timeDomain
     return item
   }
@@ -584,17 +701,29 @@ final class AbsorbAudioEngine: NSObject {
     // and its duration and ready state still have to be reported.
     statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
       self?.queue.async {
+        guard let self = self, self.currentItem === item else { return }
         switch item.status {
         case .readyToPlay:
-          self?.processingState = .ready
-          self?.emitState()
-          self?.seekPendingOnReady()
-          let d = item.asset.duration.seconds
-          if d.isFinite { self?.delegate?.engineDidLoadDuration(d) }
+          self.processingState = .ready
+          self.emitState()
+          self.seekPendingOnReady()
+          let d = item.duration.seconds
+          if d.isFinite { self.delegate?.engineDidLoadDuration(d) }
         case .failed:
-          self?.processingState = .idle
-          self?.emit("[AudioEngine] item failed: \(item.error?.localizedDescription ?? "unknown")")
-          self?.delegate?.engineDidError(message: item.error?.localizedDescription ?? "item failed", code: nil)
+          self.player.pause()
+          self.processingState = .idle
+          self.emitState()
+          let error = item.error as NSError?
+          self.emit("[AudioEngine] item failed: \(error?.localizedDescription ?? "unknown")")
+          // Log only the last path component: full URLs may contain credentials.
+          if let event = item.errorLog()?.events.last {
+            let file = event.uri.flatMap { URL(string: $0)?.lastPathComponent } ?? "unknown"
+            self.emit("[AudioEngine] failed resource=\(file) status=\(event.errorStatusCode) domain=\(event.errorDomain)")
+          }
+          self.delegate?.engineDidError(
+            message: error?.localizedDescription ?? "item failed",
+            code: error.map { "\($0.domain):\($0.code)" }
+          )
         default:
           break
         }
@@ -604,6 +733,11 @@ final class AbsorbAudioEngine: NSObject {
     tcsObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
       self?.queue.async {
         guard let self = self else { return }
+        if self.currentItem?.status == .failed {
+          self.processingState = .idle
+          self.emitState()
+          return
+        }
         switch self.player.timeControlStatus {
         case .paused:
           if self.processingState == .buffering { self.processingState = .ready }
@@ -620,9 +754,11 @@ final class AbsorbAudioEngine: NSObject {
 
     playbackBufferEmptyObs = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
       self?.queue.async {
+        guard let self = self, self.currentItem === item,
+              item.status != .failed else { return }
         if item.isPlaybackBufferEmpty {
-          self?.processingState = .buffering
-          self?.emitState()
+          self.processingState = .buffering
+          self.emitState()
         }
       }
     }
@@ -707,6 +843,7 @@ final class AbsorbAudioEngine: NSObject {
     guard !aheadInFlight, let playing = queuedTracks.first, playing.item === currentItem else { return }
     let index = lastQueuedIndex + 1
     guard index < trackUrls.count, index <= playing.index + Self.tracksQueuedAhead else { return }
+    guard !Self.isHLS(trackUrls[index]) else { return }
     aheadInFlight = true
     let generation = aheadGeneration
     let tap = eqEnabled
@@ -947,5 +1084,69 @@ final class AbsorbAudioEngine: NSObject {
   private func emit(_ line: String) {
     NSLog("%@", line)
     Self.logSink?(line)
+  }
+}
+
+// ABS lists the complete book before its on-demand transcode has produced
+// every segment. A seek must wait on the same missing segment, not walk the
+// playlist on 404 (which repeatedly moves the server's transcode window).
+enum AbsorbHLSSeekPreparation {
+  static func segmentURLs(playlist: String, baseURL: URL, position: Double) throws -> [URL] {
+    var segments: [(URL, Double)] = []
+    var duration: Double?
+    for raw in playlist.components(separatedBy: .newlines) {
+      let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if line.hasPrefix("#EXTINF:") {
+        duration = line.dropFirst(8).split(separator: ",").first.flatMap { Double($0) }
+      } else if !line.isEmpty && !line.hasPrefix("#"), let seconds = duration {
+        guard seconds > 0, let url = URL(string: line, relativeTo: baseURL)?.absoluteURL,
+              url.scheme == baseURL.scheme, url.host == baseURL.host,
+              url.port == baseURL.port else { throw URLError(.badServerResponse) }
+        segments.append((url, seconds))
+        duration = nil
+      }
+    }
+    guard !segments.isEmpty else { throw URLError(.cannotParseResponse) }
+    var elapsed = 0.0
+    var target = segments.count - 1
+    for (index, segment) in segments.enumerated() {
+      if position < elapsed + segment.1 { target = index; break }
+      elapsed += segment.1
+    }
+    return segments[target..<min(target + 2, segments.count)].map { $0.0 }
+  }
+
+  static func wait(playlistURL: URL, headers: [String: String], position: Double,
+                   timeout: TimeInterval = 45, retryNanoseconds: UInt64 = 500_000_000) async throws {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = 5
+    config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    let session = URLSession(configuration: config)
+    defer { session.invalidateAndCancel() }
+    let deadline = Date().addingTimeInterval(timeout)
+    func fetch(_ url: URL) async throws -> Data {
+      while true {
+        try Task.checkCancellation()
+        guard Date() < deadline else { throw URLError(.timedOut) }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = min(5, deadline.timeIntervalSinceNow)
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        if response.statusCode == 200 { return data }
+        // Only a missing transcode resource is retryable. Do not hide auth
+        // failures, server errors, or redirects to an HTML login page.
+        guard response.statusCode == 404 else { throw URLError(.badServerResponse) }
+        try await Task.sleep(nanoseconds: retryNanoseconds)
+      }
+    }
+    let data = try await fetch(playlistURL)
+    guard let playlist = String(data: data, encoding: .utf8), playlist.hasPrefix("#EXTM3U") else {
+      throw URLError(.cannotParseResponse)
+    }
+    for url in try segmentURLs(playlist: playlist, baseURL: playlistURL, position: position) {
+      _ = try await fetch(url)
+    }
+    try Task.checkCancellation()
   }
 }

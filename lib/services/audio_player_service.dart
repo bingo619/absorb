@@ -5288,7 +5288,11 @@ class AudioPlayerService extends ChangeNotifier {
       // Retry source and codec failures through ABS once. A distinct flag from
       // forceStartTime keeps bookmark/chapter seeks eligible for recovery while
       // still preventing a transcode loop.
-      if (!forceTranscode && PlaybackErrorPolicy.shouldRetryWithTranscode(e)) {
+      // The iOS/WMA API guard can already have replaced the direct session
+      // with HLS, even when this caller did not request forceTranscode.
+      final alreadyTranscoding =
+          forceTranscode || (Platform.isIOS && sessionPlayMethod == 2);
+      if (!alreadyTranscoding && PlaybackErrorPolicy.shouldRetryWithTranscode(e)) {
         debugPrint(
           '[Player] Source or codec error detected - retrying with server transcoding',
         );

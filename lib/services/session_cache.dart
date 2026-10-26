@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'user_account_service.dart';
+import 'playback_format_policy.dart';
 
 /// Caches playback session metadata (track URLs, chapters, duration) per item
 /// so the app can start playback immediately on cold start without waiting for
@@ -54,7 +55,15 @@ class SessionCache {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_key(itemId, episodeId));
       if (raw == null) return null;
-      return jsonDecode(raw) as Map<String, dynamic>;
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      if (PlaybackFormatPolicy.needsWmaTranscode(data)) {
+        // Old direct WMA URLs would bypass the /play compatibility check and
+        // reach AVPlayer on an instant cached start. Fetch a fresh session.
+        await prefs.remove(_key(itemId, episodeId));
+        debugPrint('[SessionCache] Discarded iOS/WMA direct-play cache');
+        return null;
+      }
+      return data;
     } catch (e) {
       debugPrint('[SessionCache] Failed to load: $e');
       return null;

@@ -561,7 +561,7 @@ let flutterEngine = FlutterEngine(name: "SharedEngine", project: nil, allowHeadl
         }
         result(true)
       case "getGroupContainerPath":
-        if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.barnabas.absorb") {
+        if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.hongbin.absorb") {
           NSLog("[WidgetDebug] getGroupContainerPath resolved: %@", url.path)
           result(url.path)
         } else {

@@ -15,6 +15,7 @@ import 'narrated_books.dart';
 import 'bookorbit_media_proxy_stub.dart'
     if (dart.library.io) 'bookorbit_media_proxy.dart';
 import 'player_settings.dart';
+import 'playback_format_policy.dart';
 import 'server_backend.dart';
 import 'socket_service.dart';
 import '../models/auth_session.dart';
@@ -2130,17 +2131,20 @@ class ApiService {
   /// Start a playback session for a library item.
   /// POST /api/items/:id/play
   /// Returns the full session object including audioTracks with contentUrl.
+  /// On iOS, an original WMA session is closed and replaced with a forced
+  /// transcode session before any caller can load its tracks.
   Future<Map<String, dynamic>?> startPlaybackSession(String itemId, {String? episodeId, bool forceDirectPlay = false, bool forceTranscode = false, double? startOffset}) async {
     try {
       final epPath = episodeId != null ? '/$episodeId' : '';
       final url = '$_cleanBaseUrl/api/items/$itemId/play$epPath';
-      debugPrint('[ABS] Starting playback session: POST $url (forceDirectPlay: $forceDirectPlay, forceTranscode: $forceTranscode)');
+      debugPrint('[ABS] Starting playback session: POST $url (forceDirectPlay: ${!forceTranscode}, forceTranscode: $forceTranscode)');
       final body = <String, dynamic>{
         'deviceInfo': _deviceInfo,
         'forceDirectPlay': !forceTranscode,
         'forceTranscode': forceTranscode,
-        // Match what the native ABS Android app sends so the server treats us
-        // as a known ExoPlayer client and picks direct-play correctly.
+        // Preserve the existing direct-play preference for other formats.
+        // The item id alone does not reveal its codec: inspect the returned
+        // tracks below and force a new transcode session for iOS/WMA only.
         'mediaPlayer': 'exo-player',
         'supportedMimeTypes': [
           'audio/flac',
@@ -2155,7 +2159,7 @@ class ApiService {
           'audio/wav',
           'audio/x-wav',
           'audio/x-matroska',
-          'audio/x-ms-wma',
+          if (!PlaybackFormatPolicy.isIOS) 'audio/x-ms-wma',
         ],
       };
       if (startOffset != null && startOffset > 0) body['startOffset'] = startOffset;
@@ -2168,6 +2172,24 @@ class ApiService {
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final tracks = data['audioTracks'] as List<dynamic>?;
+        if (PlaybackFormatPolicy.needsWmaTranscode(data)) {
+          // forceDirectPlay overrides ABS's MIME negotiation, so removing WMA
+          // from supportedMimeTypes alone cannot fix existing direct sessions.
+          // Never pass the original WMA URL to AVPlayer, including prefetches.
+          final sessionId = data['id'] as String?;
+          if (sessionId != null) await closePlaybackSession(sessionId);
+          if (forceTranscode) {
+            debugPrint('[ABS] Server still returned direct WMA after forcing transcoding');
+            return null; // At most one retry; no direct-play fallback or loop.
+          }
+          debugPrint('[ABS] iOS/WMA detected - requesting server transcoding');
+          return await startPlaybackSession(
+            itemId,
+            episodeId: episodeId,
+            forceTranscode: true,
+            startOffset: startOffset,
+          );
+        }
         debugPrint('[ABS] Session ID: ${data['id']}');
         debugPrint('[ABS] Audio tracks: ${tracks?.length ?? 0}');
         if (tracks != null && tracks.isNotEmpty) {
@@ -2823,44 +2845,11 @@ class ApiService {
   /// POST /api/items/:itemId/play/:episodeId
   Future<Map<String, dynamic>?> startEpisodePlaybackSession(
       String itemId, String episodeId, {bool forceTranscode = false}) async {
-    try {
-      final url = '$_cleanBaseUrl/api/items/$itemId/play/$episodeId';
-      debugPrint('[ABS] Starting episode session: POST $url (forceTranscode: $forceTranscode)');
-      final response = await _authPost(
-        Uri.parse(url),
-        body: jsonEncode({
-          'deviceInfo': _deviceInfo,
-          'forceDirectPlay': !forceTranscode,
-          'forceTranscode': forceTranscode,
-          'mediaPlayer': 'exo-player',
-          'supportedMimeTypes': [
-            'audio/flac',
-            'audio/mpeg',
-            'audio/mp4',
-            'audio/ogg',
-            'audio/aac',
-            'audio/x-m4a',
-            'audio/x-m4b',
-            'audio/opus',
-            'audio/webm',
-            'audio/wav',
-            'audio/x-wav',
-            'audio/x-matroska',
-            'audio/x-ms-wma',
-          ],
-        }),
-        timeout: const Duration(seconds: 20));
-
-      debugPrint('[ABS] Episode session response: ${response.statusCode}');
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body) as Map<String, dynamic>;
-      } else {
-        debugPrint('[ABS] Episode session failed: ${response.body}');
-      }
-    } catch (e) {
-      debugPrint('[ABS] Episode session error: $e');
-    }
-    return null;
+    return startPlaybackSession(
+      itemId,
+      episodeId: episodeId,
+      forceTranscode: forceTranscode,
+    );
   }
 
   /// Get server progress for a podcast episode.

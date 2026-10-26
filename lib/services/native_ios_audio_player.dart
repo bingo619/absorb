@@ -185,10 +185,11 @@ class NativeIosAudioPlayer {
     // `index` is the track within a multi-file book. The engine seeks to the
     // track-local position `s` inside that track; AudioPlayerService has
     // already converted the absolute book position into (index, local offset).
-    await _methodChannel.invokeMethod<bool>('seek', {
+    final completed = await _methodChannel.invokeMethod<bool>('seek', {
       'positionS': s,
       if (index != null) 'index': index,
     });
+    if (completed != true) return;
     _position = position ?? Duration.zero;
     if (index != null) _currentIndex = index;
     _updateTime = DateTime.now();
@@ -325,6 +326,14 @@ class NativeIosAudioPlayer {
       case 'error':
         final msg = raw['message'] as String? ?? 'engine error';
         debugPrint('[NativeIosAudioPlayer] engine error: $msg');
+        _playing = false;
+        _processingState = ja.ProcessingState.idle;
+        _processingStateController.add(_processingState);
+        _emitPlayerState();
+        _playbackEventController.addError(PlatformException(
+          code: raw['code']?.toString() ?? 'ios_audio_error',
+          message: msg,
+        ));
         break;
     }
   }

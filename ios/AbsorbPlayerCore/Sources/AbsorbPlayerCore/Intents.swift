@@ -4,7 +4,7 @@ import Foundation
 
 /// App group used by the host app, the widget extension, and these
 /// intents. Hardcoded so the package has no setup at the call site.
-public let absorbAppGroup = "group.com.barnabas.absorb"
+public let absorbAppGroup = "group.com.hongbin.absorb"
 
 // MARK: - Helpers
 

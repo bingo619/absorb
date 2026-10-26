@@ -245,7 +245,7 @@ class HomeWidgetService {
       final stashedEpisode = await HomeWidget.getWidgetData<String>(
         'np_episode_id',
       );
-      if (stashedEpisode != episodeId) return null;
+      if ((stashedEpisode ?? '') != (episodeId ?? '')) return null;
       final pos = await HomeWidget.getWidgetData<double>('np_position_s');
       return pos;
     } catch (e) {
@@ -268,7 +268,7 @@ class HomeWidgetService {
       if (stashedItem != itemId) return;
       final stashedEpisode =
           await HomeWidget.getWidgetData<String>('np_episode_id');
-      if (stashedEpisode != episodeId) return;
+      if ((stashedEpisode ?? '') != (episodeId ?? '')) return;
       await HomeWidget.saveWidgetData<double>('np_position_s', 0.0);
       debugPrint('[WidgetDebug] Cleared stashed position for $itemId ep=$episodeId');
     } catch (e) {
@@ -838,9 +838,10 @@ class HomeWidgetService {
       return;
     }
     await HomeWidget.saveWidgetData<String>('np_item_id', itemId);
-    await HomeWidget.saveWidgetData<String?>(
+    // UserDefaults cannot store null; an empty string means no episode.
+    await HomeWidget.saveWidgetData<String>(
       'np_episode_id',
-      player.currentEpisodeId,
+      player.currentEpisodeId ?? '',
     );
 
     final posSec = player.position.inMilliseconds / 1000.0;

@@ -5,7 +5,7 @@ import SwiftUI
 import AVFAudio
 import ImageIO
 
-private let appGroup = "group.com.barnabas.absorb"
+private let appGroup = "group.com.hongbin.absorb"
 
 // Deep-link URL used only by the play button when no session is loaded, so
 // the app launches and can cold-resume the last-played item. Must use the

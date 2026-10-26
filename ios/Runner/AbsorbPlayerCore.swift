@@ -24,7 +24,7 @@ final class AbsorbPlayerCore: NSObject, AbsorbPlayerCoreProtocol, @unchecked Sen
 
   static var logSink: ((String) -> Void)?
 
-  private static let appGroup = "group.com.barnabas.absorb"
+  private static let appGroup = "group.com.hongbin.absorb"
 
   private let queue = DispatchQueue(label: "com.barnabas.absorb.nativecore")
 
@@ -228,7 +228,10 @@ final class AbsorbPlayerCore: NSObject, AbsorbPlayerCoreProtocol, @unchecked Sen
       emit("[NativeCore] ensureLoaded: no np_item_id in app group")
       return false
     }
-    let episodeId = defaults?.string(forKey: "np_episode_id")
+    // Dart stores an empty string when playback has no episode.
+    let episodeId = defaults?.string(forKey: "np_episode_id").flatMap {
+      $0.isEmpty ? nil : $0
+    }
 
     // Engine already holds this exact book: adopt it, no reload.
     if AbsorbAudioEngine.shared.currentItemId == itemId, AbsorbAudioEngine.shared.isLoaded {
